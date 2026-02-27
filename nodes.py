@@ -1,7 +1,83 @@
 import torch
+import torch.nn as nn
 from safetensors.torch import save_file
 from tqdm import tqdm
 import os
+
+
+class Fp8QuantLinear(nn.Module):
+    """FP8 W8A8 量化线性层"""
+
+    def __init__(self, in_features, out_features, bias=True, fp8_format="float8_e4m3fn", device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.fp8_format = fp8_format
+
+        # FP8 量化后的权重
+        self.register_buffer("weight_fp8", torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn))
+        self.register_buffer("weight_scale", torch.tensor(1.0))
+
+        # bias 保持高精度
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+
+    def quantize_weight(self, weight):
+        """将权重量化为 FP8，并保存 scale"""
+        fp8_max = 448.0 if self.fp8_format == "float8_e4m3fn" else 57472.0
+        abs_max = weight.abs().max()
+        self.weight_scale = fp8_max / (abs_max + 1e-6)
+        self.weight_fp8 = (weight * self.weight_scale).to(dtype=torch.float8_e4m3fn)
+
+    def quantize_activation(self, x):
+        """Per-tensor 动态激活量化"""
+        fp8_max = 448.0 if self.fp8_format == "float8_e4m3fn" else 57472.0
+        abs_max = x.abs().max() + 1e-6
+        scale = fp8_max / abs_max.to(x.dtype)
+        return (x * scale).to(dtype=torch.float8_e4m3fn), scale
+
+    def forward(self, x):
+        """W8A8 前向传播，输出保持 FP8"""
+        x_fp8, x_scale = self.quantize_activation(x)
+
+        # FP8 矩阵乘法
+        out = torch.matmul(x_fp8.float(), self.weight_fp8.t().float())
+        out = out / (x_scale * self.weight_scale)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        return out.to(torch.float8_e4m3fn)
+
+
+def replace_linear_with_fp8(module, fp8_format="float8_e4m3fn", stats=None):
+    """递归替换 nn.Linear 为 Fp8QuantLinear"""
+    if stats is None:
+        stats = {"total": 0, "replaced": 0}
+
+    # 处理子模块
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            # 创建新层
+            new_layer = Fp8QuantLinear(
+                child.in_features, child.out_features,
+                child.bias is not None, fp8_format,
+                child.weight.device, child.weight.dtype
+            )
+            # 量化权重并复制 bias
+            new_layer.quantize_weight(child.weight.data)
+            if child.bias is not None:
+                new_layer.bias.data = child.bias.data.clone()
+            # 替换
+            setattr(module, name, new_layer)
+            stats["total"] += 1
+            stats["replaced"] += 1
+        else:
+            replace_linear_with_fp8(child, fp8_format, stats)
+
+    return module, stats
 
 class FP8Quantizer:
     def __init__(self, quant_dtype: str = "float8_e5m2"): #初始化，主要是选中格式
@@ -156,4 +232,40 @@ class SaveAsSafeTensor: # No changes needed
         except Exception as e:
             print(f"Error saving model as safetensor: {e}")
             return {"ui": {"text": [f"Error: {e}"]}}
+
+
+class FP8OnlineQuantizer:
+    """在线量化 ComfyUI 节点"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "fp8_format": (["float8_e4m3fn", "float8_e5m2"], {"default": "float8_e4m3fn"}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("quantized_model",)
+    FUNCTION = "quantize"
+    CATEGORY = "Model Quantization/FP8 Online"
+
+    def quantize(self, model, fp8_format):
+        # 提取实际 PyTorch 模型
+        actual_model = self._get_model(model)
+        if actual_model is None:
+            raise ValueError("无法从 MODEL 对象中提取模型")
+
+        # 替换 Linear 层
+        _, stats = replace_linear_with_fp8(actual_model, fp8_format)
+        print(f"[FP8OnlineQuantizer] 替换完成: {stats['replaced']}/{stats['total']} 层")
+
+        return (model,)
+
+    def _get_model(self, model):
+        """从 ComfyUI MODEL 对象提取实际模型"""
+        if hasattr(model, "model") and hasattr(model.model, "model"):
+            return model.model.model
+        return None
 
